@@ -331,18 +331,69 @@ async def get_insights(request: Request, payload: dict = Depends(verify_token)):
     metrics = _vectors(raw, now, today)
     vectors = metrics["vectors"]
 
-    # ── Peer / benchmark across every user that has data ──────────────────
+    # ── Peer / benchmark across users that have data ─────────────────────
+    # Bounded: we only need each peer's focus + radar vectors, which derive
+    # from segments, drops and completed-task counts (see _vectors). Loading a
+    # full _load_raw per peer (5 collection scans) is quadratic and stalls the
+    # dashboard, so we fetch just those three, cheaply, and cap the sample.
     peer_ids = set()
-    for coll in ("session.logs", "activity.drops", "tasks.log", "boards.docs"):
-        async for doc in db[coll].find({}, {"user_id": 1}):
+    for coll in ("session.logs", "activity.drops", "boards.docs"):
+        async for doc in db[coll].find(
+            {}, {"user_id": 1}
+        ):
             if doc.get("user_id") and doc["user_id"] != user_id:
                 peer_ids.add(doc["user_id"])
 
+    PEER_SAMPLE_CAP = 40
+    peer_sample = sorted(peer_ids)[:PEER_SAMPLE_CAP]
+
     peer_vectors = []
     peer_scores = []
-    for pid in peer_ids:
+    for pid in peer_sample:
         try:
-            prow = await _load_raw(db, pid, now)
+            segments = []
+            async for doc in db["session.logs"].find(
+                {"user_id": pid}, {"joined_at": 1, "left_at": 1}
+            ):
+                joined = doc.get("joined_at") or {}
+                start = _parse_iso(joined.get("time"))
+                if start is None:
+                    continue
+                end = _parse_iso(doc.get("left_at")) or now
+                if end < start:
+                    end = start
+                segments.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "total": max(0.0, float(joined.get("total") or 0)),
+                        "noact": max(0.0, float(joined.get("noact") or 0)),
+                    }
+                )
+
+            drops = []
+            async for doc in db["activity.drops"].find(
+                {"user_id": pid}, {"claimed_at": 1, "claim_rate": 1, "study_type": 1}
+            ):
+                claimed = _parse_iso(doc.get("claimed_at")) or now
+                claim = float(doc.get("claim_rate") or 0.0)
+                score = STUDY_SCORE.get(doc.get("study_type"), 0)
+                drops.append({"t": claimed, "score": score * claim, "claim": claim})
+
+            completed = 0
+            async for doc in db["boards.docs"].find(
+                {"user_id": pid}, {"tasks": 1}
+            ):
+                for task in (doc.get("tasks") or {}).values():
+                    if isinstance(task, dict) and task.get("status") == "done":
+                        completed += 1
+
+            prow = {
+                "segments": segments,
+                "drops": drops,
+                "completed": completed,
+                "total_tasks": 0,
+            }
             pmetrics = _vectors(prow, now, today)
             peer_vectors.append(pmetrics["vectors"])
             peer_scores.append(pmetrics["focus"])
