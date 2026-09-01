@@ -564,8 +564,18 @@ async def create_web_session(
     )
     if existing:
         existing_sid = existing.get("session_id") or existing.get("_id")
+        guild_id = existing.get("guild_id", "web")
+        channel_id = existing.get("channel_id", "")
         members_raw = existing.get("members", {})
-        if len(members_raw) == 1:
+
+        # Never destroy this user's active session just because they asked for
+        # a fresh web session. A solo Discord VC session is a real, live session
+        # the user is sitting in — wiping it removes them from the DB, emits
+        # session_closed (the frontend shows "session ended"), while the bot
+        # never actually moves them out of the VC. Only clean up an orphaned
+        # web-only session, and otherwise just reuse the existing session.
+        is_live_discord = guild_id != "web" and bool(channel_id) and not channel_id.startswith("w")
+        if not is_live_discord and len(members_raw) == 1:
             sm = getattr(getattr(request.app.state, "bot", None), "session_manager", None)
             if sm and existing_sid in sm.active_sessions:
                 sm._cleanup_session(sm.active_sessions[existing_sid])
@@ -586,7 +596,10 @@ async def create_web_session(
             if event_bus:
                 await event_bus.publish(existing_sid, "session_closed", {})
         else:
-            await _remove_user_from_session(request, user_id, existing, getattr(request.app.state, "event_bus", None))
+            # User already belongs to a live session (Discord VC or multi-member).
+            # Return it instead of destroying it / forcing a duplicate web session.
+            members = await _enrich_members(request, existing)
+            return _session_response(existing, members)
 
     from library.dseshpy.session import generate_session_id
     channel_id = f"w{user_id}"
